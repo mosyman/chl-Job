@@ -1571,7 +1571,8 @@ defer stopFn()
 
 我先在 aibrix 仓库里找几个带真实行号的方法示例，然后用它们来解释 Go 方法的语法机制。
 
-Go 的方法之所以能写成 `func (r *T) M()` 这种形式，根本原因是：**方法在 Go 里本质上就是“带了一个前置参数的函数”，接收者（receiver）不是特殊语法，就是一个普通参数**。下面结合本仓库的真实代码逐层解释。
+Go 的方法之所以能写成 `func (r *T) M()` 这种形式，
+根本原因是：**方法在 Go 里本质上就是“带了一个前置参数的函数”，接收者（receiver）不是特殊语法，就是一个普通参数**。下面结合本仓库的真实代码逐层解释。
 
 ## 1. 语法拆解：接收者只是一个前置参数
 
@@ -1991,3 +1992,738 @@ main()  L107
 > Go 的方法 = 把"接收者"作为第一个显式参数的普通函数；值接收者拷贝对象，指针接收者共享对象；方法集决定接口实现，指针接收者的方法集更大。设计上摒弃了隐式 `this` 和类继承，用"显式接收者 + 组合 + 接口"实现同样的能力，更简单、更灵活。
 
 如需进一步讲解某个点（如接口的动态分派、`sync.Mutex` 为什么不能拷贝、方法表达式的内部实现等），请指明。
+
+
+
+# zcode - Go「包」完全解析 —— 以 aibrix 源码为例
+
+## 一、包是什么：三级结构 模块 → 目录(包) → 文件
+
+Go 的代码组织是三层结构，**一个目录 = 一个包，包是编译、导入、可见性的基本单位**：
+
+```
+模块 (Module) = go.mod 声明的整个仓库
+│
+├── module github.com/vllm-project/aibrix          ← go.mod:1  模块路径
+│   go 1.22.5                                       ← go.mod:3  语言版本
+│
+├── cmd/controllers/                                ← 目录 = 导入路径的最后一段
+│   ├── main.go      package main                   ← main.go:17(可执行入口)
+│   └── main_test.go package main                   ← 同包测试文件
+│
+├── pkg/utils/
+│   ├── util.go      package utils                  ← util.go:17
+│   └── (其他文件)   也必须是 package utils           ← 同目录必须同包名!
+│
+└── pkg/types/
+    └── router.go    package types                  ← 公共接口"下沉"包
+```
+
+**文字解释上图**：最外层是**模块**，由仓库根目录的 `go.mod:1` 声明为 `github.com/vllm-project/aibrix`,它规定了本仓库所有包的“姓”。中间层是目录，一个目录下所有 `.go` 文件的导入路径相同。最内层是文件，同一目录下**每个文件第一行有效代码的包名必须一致**(测试文件除外，见第九节)，否则编译报错 `found packages X and Y`。
+
+**导入路径的计算公式**:`导入路径 = 模块路径(go.mod:1) + 目录相对路径`。
+例如 `pkg/utils/util.go:17` 声明 `package utils`,外部引用它时写 `github.com/vllm-project/aibrix/pkg/utils`(见 `pkg/client/applyconfiguration/internal/internal.go` 等处的用法)。
+
+---
+
+## 二、包声明:`package xxx`
+
+- 位置：必须是文件第一条顶级声明，只能在版权/文档注释之后。例：`cmd/controllers/main.go:17` 的 `package main`;`pkg/utils/util.go:17` 的 `package utils`。
+- **包名 ≠ 目录名也合法**(但不是好实践)：目录叫 `algorithms`,包名却是 `routingalgorithms`(`pkg/plugins/gateway/algorithms/least_busy_time.go:17`)。此时导入者必须用别名消除困惑:`cmd/plugins/main.go:45` 写了 `routing "github.com/vllm-project/aibrix/pkg/plugins/gateway/algorithms"` —— 把导入名重新拗回 `routing`。这正说明：**代码里使用的是包名，不是目录名**。
+
+---
+
+## 三、import 导入：五种形态
+
+以 `cmd/controllers/main.go:19-57` 为例，这是教科书级的 import 块：
+
+```go
+import (
+    // ① 标准库组:只有路径,包名即路径最后一段
+    "crypto/tls"        // main.go:20
+    "errors"            // main.go:21
+
+    // ② 命名导入(别名):解决包名冲突或简化长包名
+    clientgoscheme "k8s.io/client-go/kubernetes/scheme"  // main.go:28
+    rayclusterv1 "github.com/ray-project/kuberay/..."    // main.go:30
+    autoscalingv1alpha1 "github.com/vllm-project/aibrix/api/autoscaling/v1alpha1" // main.go:31
+    ctrl "sigs.k8s.io/controller-runtime"                // main.go:46
+    cfg "github.com/vllm-project/aibrix/pkg/config"      // main.go:52
+
+    // ③ 空白导入 _:只执行目标包的 init()/副作用,不直接使用其标识符
+    _ "k8s.io/client-go/plugin/pkg/client/auth"          // main.go:40
+)
+```
+
+另两个仓库内的空白导入实例:`cmd/plugins/main.go:33` 的 `_ "go.uber.org/automaxprocs"`(自动把 GOMAXPROCS 对齐容器 CPU 配额，副作用即全部目的)。
+
+**文字解释三种导入的区别与原理**：
+1. **普通导入**：编译器把目标包加入编译图，导入者用 `包名.标识符` 访问，如 `main.go:67` 的 `runtime.NewScheme()`(导入于 main.go:38)。
+2. **命名导入**：Go 不允许两个同名包同时裸导入(例如都想叫 `v1`),别名是唯一解法。aibrix 的惯例是别名带版本后缀(`autoscalingv1alpha1`、`rayclusterv1`),这是 K8s 生态的标准做法，因为大量 API 组的最后一段目录都是 `v1alpha1`。
+3. **空白导入 `_`**:只为触发目标包的初始化。这是 Go **插件注册模式**的基石(第六节详解)。若导入后一个标识符都没用到，Go 编译器直接报错"imported and not used"——空白导入是唯一豁免方式。
+4. (反例)**点导入 `.`**:把对方所有导出标识符倒进当前命名空间，污染严重，Go 官方与 aibrix 都不使用，仅测试文件偶见。
+5. **分组规范**：aibrix 的 import 分三组——标准库 / 第三方+外部组 / 本仓库组(main.go:20-26、28-49、51-56),`//+kubebuilder:scaffold:imports`(main.go:56)是代码生成器锚点注释。`make fmt`/gci 会按此排序。
+
+---
+
+## 四、可见性：没有 public/private,只有大小写
+
+Go 用**首字母大小写**一个规则替代了 Java/C++ 的 public/private/protected:
+
+| 标识符首字母 | 可见范围 | 例子 |
+|---|---|---|
+| 大写 | 导出(exported),任何导入者可用 | `RouterLeastBusyTime`(least_busy_time.go:26) |
+| 小写 | 未导出(unexported),仅本包可见 | `leastBusyTimeRouter`(least_busy_time.go:32) |
+
+同一个文件里对照最明显(`pkg/plugins/gateway/algorithms/least_busy_time.go`):
+
+```go
+const RouterLeastBusyTime types.RoutingAlgorithm = "least-busy-time"  // :26 大写→导出,外部可引用
+
+type leastBusyTimeRouter struct {   // :32 小写→包外不可见,隐藏实现细节
+    cache cache.Cache               // :33 字段名小写,包外也无法直接读
+}
+
+func NewLeastBusyTimeRouter() (types.Router, error) {  // :36 大写→导出的构造函数
+    ...
+    return leastBusyTimeRouter{...} // :42 包内可见,构造后以接口 types.Router 的形式交给外部
+}
+```
+
+**文字解释**：这构成了 Go 的**封装惯用法**——“小写结构体 + 大写构造函数 + 返回接口”。包外的代码拿到的是 `types.Router` 接口(`pkg/types/router.go:20`),永远无法构造或断言成具体的 `leastBusyTimeRouter`,实现了“隐藏实现、只暴露行为”。同理，注册表本体也是私有的:`router.go:686-687` 的 `routerFactory`、`routerConstructor` 两个 map 是小写字段，而操作它们的门面 `Register()` 是导出函数(router.go:1020)。**可见性以“包”为边界**，同一个包的不同文件可以互相访问小写标识符——所以包不能太大，否则封装形同虚设。
+
+---
+
+## 五、包初始化：确定性顺序 常量 → 变量 → init()
+
+```
+程序启动 (go run / 二进制执行)
+   │
+   ▼
+① 编译器解析包级依赖,按 import 关系做拓扑排序(无环才通过)
+   │
+   ▼
+② 被导入的包先初始化(最深依赖最先):
+     常量(const) → 包级变量(var) → init() 函数
+   │
+   ▼
+③ 同一包内:多个 init() 按"文件名排序"依次执行,每个只执行一次
+   │
+   ▼
+④ 最后执行 main 包,进入 func main()
+```
+
+**文字解释上图**：Go 规范保证这个顺序是**完全确定的**。依赖包 A 的初始化一定先于导入者 B——这是 init() 里能安全注册插件的前提(第六节)。每个包无论被多少个包导入，**只会初始化一次**(编译器保证)，天然是单例。
+
+看 `cmd/controllers/main.go` 的三段式布局，正是这个顺序的代码投影：
+
+```go
+const (                                   // :59 常量最先就绪
+    defaultLeaseDuration = 15 * time.Second  // :60
+)
+
+var (                                    // :66 包级变量
+    scheme   = runtime.NewScheme()       // :67 变量初始化可调用函数
+    setupLog = ctrl.Log.WithName("setup") // :68 可引用前面已初始化的变量
+)
+
+func init() {                            // :73 变量之后执行
+    utilruntime.Must(clientgoscheme.AddToScheme(scheme))  // :75 scheme 已在 :67 就绪
+    scheme.AddUnversionedTypes(...)      // :77
+}
+```
+
+`pkg/utils/util.go` 展示了 init() 的典型用途——**昂贵的只读资源一次性加载**：
+
+```go
+var tke *tiktoken.Tiktoken               // util.go:47 先声明包级变量
+
+func init() {                            // util.go:49
+    // Tiktoken 初始化很慢,init 一次,函数里反复用   ← util.go:50 原注释
+    tiktoken.SetBpeLoader(...)           // :52
+    tke, err = tiktoken.GetEncoding(encoding) // :54 给包级变量赋值
+    if err != nil { panic(err) }         // :56 init 无法返回 error,致命错误只能 panic
+}
+```
+
+**init() 的语法规则**：无参数、无返回值、不能被显式调用、一个文件可写多个、一个包可有任意多个。**代价**：init 失败只能 panic(如 util.go:56),且隐藏了依赖关系——所以 Go 社区最佳实践是“能用显式初始化函数就不用 init”。对照 `pkg/client/applyconfiguration/internal/internal.go:27-39` 的 `sync.Once` 惰性初始化：把代价推迟到第一次 `Parser()` 调用时，且可返回错误，是对 init() 的改良。
+
+---
+
+## 六、init() + 空白导入 = Go 插件注册模式(aibrix 核心架构)
+
+aibrix 有 28 个路由算法文件(`pkg/plugins/gateway/algorithms/` 下 28 个非测试 .go),其中 **17 个各含一个 init()**。以最少忙时间路由为例：
+
+```go
+// least_busy_time.go:26-30
+const RouterLeastBusyTime types.RoutingAlgorithm = "least-busy-time"
+
+func init() {
+    Register(RouterLeastBusyTime, NewLeastBusyTimeRouter)  // :29 把"名字→构造器"塞进全局注册表
+}
+```
+
+注册表本体在 `router.go`:`Register`(router.go:1020)只是转发给包级单例 `defaultRM` 的方法；真正存储的是小写 map `routerFactory`(router.go:686),写入时用互斥锁保护(router.go:1025-1027)。
+
+```
+      import (blank _)                          func main()
+   ┌────────────────────┐                    ┌──────────────────┐
+   │ 算法文件 A          │   init()           │                  │
+   │ least_busy_time.go │──Register(名,构造)──▶  defaultRM        │
+   │ least_util.go      │──Register(...)────▶  routerFactory map │◀─按名字取构造器
+   │ prefix_cache.go    │──Register(...)────▶  (:686, 小写私有)  │
+   └────────────────────┘                    └──────────────────┘
+```
+
+**文字解释上图**：主程序想启用哪些算法，只需**空白导入**(或普通导入)对应文件，`init()` 在 main 之前自动把它登记进注册表；主程序运行期按算法名字符串从 map 取构造器实例化。新增算法 = 新增一个文件 + 一行 import,**完全不改核心代码**，这就是“开闭原则”的 Go 实现方式。K8s 生态(database/sql 驱动、controller-runtime scheme)大量使用此模式。
+
+---
+
+## 七、main 包：特殊的包
+
+`cmd/` 下每个子目录都是 `package main`(如 `cmd/controllers/main.go:17`),且必须有一个 `func main()` 作为程序入口。**main 包被谁导入谁就是库，不被导入而是编译成可执行文件**。这就是 aibrix 的布局哲学：`cmd/` 只放薄入口(AGENTS.md 也要求 "keep `cmd/` entrypoints thin"),真正逻辑全在 `pkg/`(列表见 `pkg/` 下 cache/client/config/controller/metrics/plugins/types/utils/webhook 等 12 个子包)。
+
+---
+
+## 八、internal 包：编译器强制的访问边界
+
+`pkg/client/applyconfiguration/internal/internal.go:18` 声明 `package internal`。**规则**：路径中含 `internal/` 段的包，只有位于 `internal/` **父目录之上**的包才能导入它。这里即：只有 `pkg/client/applyconfiguration/...` 之内的代码可以导入 internal 包，仓库外或其它模块导入会直接**编译失败**。
+
+它是“文档性约定(如下划线前缀)”的升级版——由编译器强制，绝无绕过可能。aibrix 用它藏住生成的 schema 解析器(internal.go:38-39 的 `parserOnce`、`parser` 都是小写，双重保险)。这也是自动生成代码的标准位置，文件头 `// Code generated by applyconfiguration-gen. DO NOT EDIT.`(internal.go:16)配合。
+
+---
+
+## 九、测试包：包内测试 vs 外部测试
+
+`pkg/kvevent/manager_test.go:16-22` 同时展示了两个知识点：
+
+```go
+//go:build zmq          // :16 构建标签:不带 -tags zmq 编译时,此文件被整体排除
+// +build zmq           // :17 旧式标签(Go 1.17 前兼容)
+
+package kvevent_test    // :19 外部测试包!名字 = 被测包名 + "_test"
+
+import (
+    "testing"
+    "github.com/vllm-project/aibrix/pkg/kvevent"  // :23 必须像普通用户一样导入被测包
+)
+```
+
+**文字解释**：
+- **`package kvevent`(包内测试)**：测试文件与被测代码同包，能访问小写私有标识符，适合测内部函数；缺点是测试代码能“作弊”穿透封装。
+- **`package kvevent_test`(外部测试)**：只能访问导出标识符，**强迫你像真实使用者一样调用 API**,是更好的黑盒测试；`go test` 会把它编译成独立包再链接进测试二进制。同一目录下 `foo` 与 `foo_test` 两种包名可以共存，是“同目录同包名”规则的唯一法定例外。
+- **构建标签**(manager_test.go:16):`//go:build` 必须在 package 子句之前、后跟空行。aibrix 用 `zmq` 标签把依赖 ZeroMQ 的测试隔离，默认 `make test` 不会编译它们，需要 CGO/ZMQ 环境时才 `go test -tags zmq`。
+
+---
+
+## 十、循环依赖：Go 唯一不准的依赖形态
+
+Go 包依赖必须是 **DAG(有向无环图)**，`A imports B` 且 `B imports A` 直接编译错误 *import cycle not allowed*。没有例外，也没有绕过语法(Java 里类之间的循环引用在包级别被彻底禁止)。
+
+```
+        ┌────────────┐
+        │ pkg/types  │  只有接口/纯数据(types/router.go:20 Router 接口)
+        │  (最底层)  │  不 import 任何业务包 → 永远不会成环
+        └─────▲──────┘
+        imports│(向上依赖,箭头永远从上层指向下层)
+   ┌──────────┴───────────┐
+   │ algorithms 包         │──▶ pkg/cache, pkg/metrics (并行的兄弟层)
+   │ (least_busy_time.go  │
+   │  :20-22 import 三者)  │
+   └──────────▲───────────┘
+             │
+        cmd/plugins (最上层入口)
+```
+
+**文字解释上图**：箭头方向即 import 方向，只准从上往下。解环的惯用手法是**“接口下沉”**：当 A、B 互相需要对方能力时，把共同依赖的抽象抽到更底层的包。aibrix 的 `pkg/types` 正是这么用的——`least_busy_time.go:20-22` 同时导入 `pkg/cache`、`pkg/metrics`、`pkg/types`,路由器实现 `types.Router` 接口(`pkg/types/router.go:20`),工厂签名 `types.RouterConstructor`(`pkg/types/router.go:55`);`cache`、`metrics`、`algorithms` 三者互不 import,全靠 types 里的接口解耦。这也是 `go vet ./...`/`make vet` 能全绿的结构前提。
+
+---
+
+## 十一、包文档：doc.go 与包注释
+
+紧贴 `package xxx` 之上、以 `// Package xxx` 开头的注释是包文档(`go doc` 与 godoc.org 展示)。aibrix 对公共复杂包单独建 `doc.go`,如 `pkg/kvevent/doc.go`;也有内联在源文件顶部的，如 `pkg/cache/discovery/discovery.go`。规范要点：全包**只能有一处**包注释；放在 doc.go 里是社区惯例，避免多文件争抢。
+
+---
+
+## 十二、最佳实践总结(全部对应仓库实例)
+
+1. **包名**：短、全小写、无下划线、单数名词(`utils`、`cache`、`types`)。反例即代价:`algorithms` 目录起了包名 `routingalgorithms`(least_busy_time.go:17),导致每个导入者都要手写别名 `routing`(cmd/plugins/main.go:45)。
+2. **调用方决定昵称，被调方管好名字**：import 分三组(标准库/第三方/本仓库)，如 main.go:19-57。
+3. **最小导出面**：小写实现 + 大写构造器 + 返回接口(least_busy_time.go:32-45);注册表私有、只暴露 `Register`(router.go:1020)。
+4. **init() 克制使用**：只用于“注册”和“不可失败的常量级准备”(least_busy_time.go:28);可失败的慢初始化优先 `sync.Once`(internal.go:27-39)或显式 `Init()`,因为 init 里只能 panic(util.go:56)。
+5. **内部实现放 internal/**(internal.go:18),生成代码标注 DO NOT EDIT(internal.go:16)。
+6. **测试默认写外部测试包 `foo_test`**(manager_test.go:19),逼自己以用户视角验证导出 API;测私有函数再退回包内测试。
+7. **平台/依赖差异用构建标签隔离**(manager_test.go:16 的 `//go:build zmq`)。
+8. **解循环依赖靠 types 接口下沉**，依赖只准单向(第十节图)。
+9. **包边界 = 封装边界 = 职责边界**：AGENTS.md 要求“可复用实现进 `pkg/`,`cmd/` 保持薄入口”，一个包只做一件事(如 `pkg/kvevent` 只管 KV 事件，`pkg/cert` 只管证书)。
+
+如果你想更深入某一块(比如 init 与 goroutine 的关系、构建标签的所有变体、或 controller-runtime 的 scheme 注册链路)，告诉我，我可以继续沿着这些文件往下挖。
+
+
+
+# trae - Go 语言「包（Package）」详解
+
+## 一、包是什么？为什么需要包？
+
+**包（Package）** 是 Go 语言中代码组织和编译的基本单位。一个包由**同一个目录下**的一个或多个 `.go` 文件组成，它们共享同一个包名，共同提供一组相关的功能。
+
+包的核心作用有三个：
+1. **命名空间隔离**：不同包可以有同名的类型/函数，通过包名限定避免冲突。
+2. **封装与可见性控制**：通过首字母大小写控制导出（公有）与非导出（私有）。
+3. **复用与依赖管理**：通过 import 引入其他包，配合 module 管理版本。
+
+类比 Java：Go 的「包」≈ Java 的 `package`，但 Go 的包与目录是强绑定的（一个目录一个包），且没有 Java 那样的 `public/private/protected` 关键字，靠首字母大小写区分可见性。
+
+---
+
+## 二、包声明语法：`package` 关键字
+
+每个 `.go` 文件的第一条非注释语句必须是包声明：
+
+```go
+package <包名>
+```
+
+### 真实示例
+
+**示例 1：可执行程序的入口包 `main`**
+
+[cmd/plugins/main.go:17](file:///Users/chl/chl-code/Job/aibrix/cmd/plugins/main.go#L17)
+```go
+package main
+```
+
+`main` 是一个特殊的包名。只有 `package main` 且包含 `func main()` 的包才能被编译成可执行文件。这里 [main.go:107](file:///Users/chl/chl-code/Job/aibrix/cmd/plugins/main.go#L107) 定义了 `func main()`，整个 `cmd/plugins` 目录会被编译成 gateway-plugin 二进制。
+
+**示例 2：库包（library package）**
+
+[pkg/plugins/gateway/gateway.go:17](file:///Users/chl/chl-code/Job/aibrix/pkg/plugins/gateway/gateway.go#L17)
+```go
+package gateway
+```
+
+这是一个库包，提供网关功能，被其他包 import 使用，不能单独编译为可执行文件。
+
+**示例 3：包名与目录名不一致（合法但需注意）**
+
+[pkg/plugins/gateway/algorithms/router.go:17](file:///Users/chl/chl-code/Job/aibrix/pkg/plugins/gateway/algorithms/router.go#L17)
+```go
+package routingalgorithms
+```
+
+这里目录是 `algorithms/`，但包名是 `routingalgorithms`。这是合法的——**包名不一定要和目录名相同**。但这会给使用者带来困惑，所以最佳实践是**包名尽量与目录名一致**。本项目里这个不一致导致 import 时必须用别名（见下文）。
+
+---
+
+## 三、Module（模块）与包的关系
+
+Go 1.11+ 使用 **Go Modules** 管理依赖。一个 module 是一个或多个包的集合，由根目录的 `go.mod` 定义。
+
+### go.mod 文件
+
+[go.mod:1-5](file:///Users/chl/chl-code/Job/aibrix/go.mod#L1-L5)
+```go
+module github.com/vllm-project/aibrix  // 模块路径（module path）
+
+go 1.22.5        // 最低 Go 版本
+toolchain go1.22.6  // 工具链版本
+```
+
+**模块路径（module path）** `github.com/vllm-project/aibrix` 是这个仓库下所有包的导入路径前缀。例如：
+- 包 `pkg/plugins/gateway` 的完整导入路径是 `github.com/vllm-project/aibrix/pkg/plugins/gateway`
+- 包 `pkg/cache` 的完整导入路径是 `github.com/vllm-project/aibrix/pkg/cache`
+
+### 多 module 仓库
+
+这个仓库里还有一个独立的 module：
+
+[brixbench/go.mod:1](file:///Users/chl/chl-code/Job/aibrix/brixbench/go.mod#L1)
+```go
+module github.com/vllm-project/aibrix/brixbench
+```
+
+`brixbench/` 目录有自己的 `go.mod`，是一个**独立 module**。它和根 module 是隔离的，各自管理自己的依赖。这是「多 module 仓库」的常见做法，常用于把工具/子项目独立出版。
+
+---
+
+## 四、导入（import）语法详解
+
+`import` 用于引入其他包。支持四种形式：
+
+### 4.1 标准库导入（无路径前缀）
+
+[cmd/plugins/main.go:20-29](file:///Users/chl/chl-code/Job/aibrix/cmd/plugins/main.go#L20-L29)
+```go
+import (
+    "flag"
+    "fmt"
+    "math"
+    "net"
+    "net/http"
+    "os"
+    "os/signal"
+    "runtime"
+    "sync"
+    "syscall"
+)
+```
+
+标准库包直接用短路径（如 `fmt`、`net/http`），Go 工具链知道去哪里找。注意 `net/http` 是 `net` 包下的子包，但它们是**两个独立的包**（`net` 和 `http`），只是目录有层级关系。
+
+### 4.2 第三方/本仓库包导入（完整路径）
+
+[cmd/plugins/main.go:31-51](file:///Users/chl/chl-code/Job/aibrix/cmd/plugins/main.go#L31-L51)
+```go
+import (
+    "go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+    "google.golang.org/grpc"
+    "k8s.io/client-go/kubernetes"
+    "github.com/vllm-project/aibrix/pkg/cache"           // 本仓库包
+    "github.com/vllm-project/aibrix/pkg/plugins/gateway"  // 本仓库包
+    ...
+)
+```
+
+第三方和本仓库包都用**完整导入路径**（module path + 子目录）。
+
+### 4.3 带别名的导入（alias）
+
+当包名与目录名不一致、或有重名冲突、或名字太长时，用别名：
+
+[cmd/plugins/main.go:40-45](file:///Users/chl/chl-code/Job/aibrix/cmd/plugins/main.go#L40-L45)
+```go
+import (
+    extProcPb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"  // 别名 extProcPb
+    routing "github.com/vllm-project/aibrix/pkg/plugins/gateway/algorithms"      // 别名 routing
+    ...
+)
+```
+
+- `extProcPb`：原始包名是 `v3`（不具描述性），起别名更清晰。
+- `routing`：因为 `algorithms/` 目录的包名是 `routingalgorithms`，这里用别名 `routing` 简化调用。使用时写 `routing.ModelRouterFactory`（见 [main.go:206](file:///Users/chl/chl-code/Job/aibrix/cmd/plugins/main.go#L206)）。
+
+同样在 [gateway.go:50](file:///Users/chl/chl-code/Job/aibrix/pkg/plugins/gateway/gateway.go#L50)：
+```go
+routing "github.com/vllm-project/aibrix/pkg/plugins/gateway/algorithms"
+```
+
+### 4.4 点导入（`.`，把包内容并入当前命名空间）
+
+```go
+import . "fmt"
+// 之后可以直接写 Println("hi") 而不用 fmt.Println
+```
+
+**不推荐在生产代码中使用**，会导致命名冲突和可读性下降。常见于测试文件中简化断言。
+
+### 4.5 空导入（`_`，仅触发副作用）
+
+[cmd/plugins/main.go:33](file:///Users/chl/chl-code/Job/aibrix/cmd/plugins/main.go#L33)
+```go
+_ "go.uber.org/automaxprocs"
+```
+
+`_` 表示导入但不直接使用其中的标识符，目的是**执行该包的 `init()` 函数**。`automaxprocs` 包的 `init()` 会自动把 `GOMAXPROCS` 设为容器 CPU 配额，这是典型的「副作用导入」。
+
+另一个例子 [cmd/controllers/main.go:40](file:///Users/chl/chl-code/Job/aibrix/cmd/controllers/main.go#L40)：
+```go
+_ "k8s.io/client-go/plugin/pkg/client/auth"
+```
+触发 Kubernetes 各种认证插件的注册。
+
+---
+
+## 五、可见性控制：导出 vs 非导出
+
+Go 没有 `public/private` 关键字，**靠标识符首字母的大小写**决定包外是否可见：
+
+| 首字母 | 可见性 | 说明 |
+|--------|--------|------|
+| 大写（Exported） | 包外可访问 | 公有 |
+| 小写（Unexported） | 仅包内可访问 | 私有 |
+
+### 真实示例
+
+[gateway.go:59-60 区域](file:///Users/chl/chl-code/Job/aibrix/pkg/plugins/gateway/gateway.go#L59)：
+```go
+const (
+    defaultAIBrixNamespace = "aibrix-system"   // 小写开头：包内私有
+    ...
+)
+```
+
+[least_util.go:26-30](file:///Users/chl/chl-code/Job/aibrix/pkg/plugins/gateway/algorithms/least_util.go#L26-L30)：
+```go
+const RouterUtil types.RoutingAlgorithm = "least-utilization"  // 大写：导出
+
+func init() {
+    Register(RouterUtil, NewLeastUtilRouter)  // Register 是同包内函数
+}
+```
+
+[least_util.go:32-34](file:///Users/chl/chl-code/Job/aibrix/pkg/plugins/gateway/algorithms/least_util.go#L32-L34)：
+```go
+type leastUtilRouter struct {   // 小写开头：包内私有结构体
+    cache cache.Cache
+}
+```
+
+[least_util.go:36](file:///Users/chl/chl-code/Job/aibrix/pkg/plugins/gateway/algorithms/least_util.go#L36)：
+```go
+func NewLeastUtilRouter() (types.Router, error) {  // 大写：导出的构造函数
+```
+
+**设计模式**：结构体本身小写（私有），通过大写的构造函数 `NewXxx()` 返回接口类型，外部只能通过接口操作——这是 Go 经典的**封装手法**。
+
+**注意**：结构体字段的可见性也是按首字母。如果一个导出的结构体有小写字段，外部包无法直接读写该字段。
+
+---
+
+## 六、包的初始化：`init()` 函数
+
+每个包可以定义零个或多个 `init()` 函数，**没有参数也没有返回值**。它们在包被导入时自动执行，且**只执行一次**。
+
+### 执行顺序规则
+
+1. 先初始化被导入的包（依赖优先）。
+2. 同一个包内，按文件名字母序依次执行各文件的 `init()`。
+3. 同一个文件内可以有多个 `init()`，按出现顺序执行。
+4. 所有包的 `init()` 执行完毕后，才执行 `main()`。
+
+### 真实示例
+
+**示例 1：副作用初始化**
+
+[pkg/utils/util.go:49-58](file:///Users/chl/chl-code/Job/aibrix/pkg/utils/util.go#L49-L58)
+```go
+var tke *tiktoken.Tiktoken  // 包级变量
+
+func init() {
+    tiktoken.SetBpeLoader(tiktoken_loader.NewOfflineLoader())
+    var err error
+    tke, err = tiktoken.GetEncoding(encoding)  // 初始化 tokenizer
+    if err != nil {
+        panic(err)
+    }
+}
+```
+包被导入时就完成 tiktoken 词典的加载（较慢），后续 `TokenizeInputText` 直接复用。
+
+**示例 2：注册表模式（Registry Pattern）**
+
+[least_util.go:28-30](file:///Users/chl/chl-code/Job/aibrix/pkg/plugins/gateway/algorithms/least_util.go#L28-L30)
+```go
+func init() {
+    Register(RouterUtil, NewLeastUtilRouter)
+}
+```
+
+这是 Go 中非常经典的**自注册模式**：每个路由算法文件在自己的 `init()` 里把自己注册到全局路由表。新增一种算法只需添加一个文件，无需修改已有代码——符合开闭原则。`Register` 函数通常在同包的另一个文件（如 `router.go`）中定义。
+
+---
+
+## 七、包级变量与常量
+
+`var` 和 `const` 在函数外部声明就是**包级**作用域，整个包内所有文件都可访问。
+
+[cmd/plugins/main.go:54-67](file:///Users/chl/chl-code/Job/aibrix/cmd/plugins/main.go#L54-L67)
+```go
+const (
+    defaultGRPCMaxMessageSizeBytes = 4 * 1024 * 1024
+    envGRPCMaxMessageSizeBytes     = "AIBRIX_GRPC_MAX_MESSAGE_SIZE_BYTES"
+    ...
+)
+
+var (
+    grpcAddr        string
+    httpAddr        string
+    metricsAddr     string // deprecated: use httpAddr
+    standalone      bool
+    endpointsConfig string
+)
+```
+
+这些是 `main` 包内所有文件共享的变量。注意包级 `var` 会在 `init()` 之前按声明顺序初始化。
+
+---
+
+## 八、`internal` 包：强制的访问边界
+
+Go 有一个特殊目录名 `internal`，**只有 `internal` 目录的父目录及其子目录**才能导入它下面的包。这是 Go 提供的**硬性封装机制**（编译期强制）。
+
+### 真实示例
+
+[brixbench/internal/resolver/resolver.go:17](file:///Users/chl/chl-code/Job/aibrix/brixbench/internal/resolver/resolver.go#L17)
+```go
+package resolver
+```
+
+这个包位于 `brixbench/internal/resolver/`，因此：
+- ✅ `brixbench/` 及其子目录可以 import `github.com/vllm-project/aibrix/brixbench/internal/resolver`
+- ❌ 仓库根 module 的代码（如 `cmd/`、`pkg/`）**不能** import 它，编译器会报错。
+
+`internal` 用于实现「对 module 内部公开、对外部私有」的 API，比首字母大小写更严格。
+
+---
+
+## 九、包文档：`doc.go`
+
+Go 约定用一个名为 `doc.go` 的文件（只含包声明和注释）来写包的整体文档。
+
+[pkg/kvevent/doc.go:18-50](file:///Users/chl/chl-code/Job/aibrix/pkg/kvevent/doc.go#L18-L50)
+```go
+// Package kvevent provides KV cache event synchronization functionality.
+//
+// This package implements the event management system for AIBrix's distributed
+// KV cache. ...
+//
+// Architecture:
+//
+// The package defines interfaces that decouple it from the cache implementation:
+//   - PodProvider: Provides access to pod information
+//   ...
+package kvevent
+```
+
+注释以 `Package <包名>` 开头，`go doc` 工具和 godoc 网站会自动提取这段文字作为包文档。**最佳实践：每个对外暴露的包都应有 doc.go**。
+
+注意这个文件还有构建约束：
+[doc.go:15-16](file:///Users/chl/chl-code/Job/aibrix/pkg/kvevent/doc.go#L15-L16)
+```go
+//go:build zmq
+// +build zmq
+```
+表示只有带 `-tags=zmq` 编译时才包含这个包——这属于构建标签（build tags），不是包概念本身，但常和包组织一起出现。
+
+---
+
+## 十、循环依赖（Circular Dependency）
+
+Go **不允许包之间循环导入**。如果 A import B，B 又 import A，编译器直接报错。
+
+[kvevent/doc.go:31-34](file:///Users/chl/chl-code/Job/aibrix/pkg/kvevent/doc.go#L31-L34) 的注释明确提到了这一点：
+> This design breaks the circular dependency that existed when the event manager was part of the cache package.
+
+### 解决循环依赖的常用方法
+
+1. **提取接口到第三方包**：让 A 和 B 都依赖接口包 C，而不是互相依赖。
+2. **依赖倒置**：上层定义接口，下层实现。
+3. **合并包**：如果两个包强耦合，不如合并成一个。
+
+kvevent 包的做法是**定义接口（PodProvider、SyncIndexProvider 等）**，由 cache 包去实现这些接口，从而打破循环。
+
+---
+
+## 十一、包的命名与组织最佳实践
+
+结合本项目的代码，总结 Go 社区的包组织规范：
+
+### 11.1 命名规范
+- **全小写**，不用下划线、不用驼峰。（本项目 `routingalgorithms` 违反了「简短」原则，理想应拆目录或改名）
+- **简短且具描述性**：`cache`、`utils`、`metrics`、`gateway` 都很好。
+- **避免 `common`、`util`、`shared` 这种无意义名字**（`utils` 在大型项目中常见但饱受争议，本项目也存在）。
+- **包名应与目录名一致**，不一致时必须用别名，增加认知负担。
+
+### 11.2 组织规范
+- **一个目录一个包**，不要在同一目录放多个 `package`。
+- **按职责分层**，本项目就是典型的分层：
+  ```
+  pkg/
+  ├── cache/          # 缓存核心
+  │   └── discovery/  # 发现机制（子包）
+  ├── controller/     # K8s 控制器
+  ├── plugins/
+  │   └── gateway/    # 网关插件
+  │       ├── algorithms/  # 路由算法
+  │       ├── queue/       # 队列
+  │       └── ratelimiter/ # 限流
+  └── utils/          # 通用工具
+  ```
+- **`cmd/` 放可执行入口**，每个子目录是一个 `package main`。本项目有 `cmd/plugins`、`cmd/controllers`、`cmd/console`、`cmd/kvcache-watcher`。
+- **`pkg/` 放可被外部导入的库**（Go 社区惯例，非强制）。
+- **`internal/` 放仅 module 内部使用的代码**。
+
+### 11.3 API 设计规范
+- 对外暴露的类型/函数/常量/变量**首字母大写**，并写注释（注释必须以标识符名开头，这是 `golint`/`revive` 的要求）。
+- 构造函数命名为 `NewXxx()`，返回接口而非具体类型（见 [least_util.go:36](file:///Users/chl/chl-code/Job/aibrix/pkg/plugins/gateway/algorithms/least_util.go#L36)）。
+- 尽量用**小接口**，接口定义在消费方而非实现方。
+
+---
+
+## 十二、ASCII 图：包的整体关系
+
+以 `cmd/plugins/main.go` 为例，展示它依赖的包层级关系：
+
+```
+                    ┌──────────────────────────┐
+                    │   package main           │  ← cmd/plugins/main.go
+                    │   (可执行入口)            │
+                    └────────────┬─────────────┘
+                                 │ import
+           ┌─────────────────────┼──────────────────────┐
+           │                     │                      │
+           ▼                     ▼                      ▼
+   ┌───────────────┐   ┌──────────────────┐   ┌────────────────────┐
+   │ 标准库        │   │ 第三方库          │   │ 本仓库包 (pkg/)    │
+   │ flag,fmt,net  │   │ grpc,k8s,otel    │   │ cache, gateway...  │
+   └───────────────┘   └──────────────────┘   └─────────┬──────────┘
+                                                         │
+                                                         ▼
+                                              ┌─────────────────────┐
+                                              │ pkg/plugins/gateway │ package gateway
+                                              └──────────┬──────────┘
+                                                         │ import
+                                              ┌──────────┴──────────┐
+                                              ▼                     ▼
+                                    ┌─────────────────┐   ┌───────────────────┐
+                                    │ pkg/cache       │   │ algorithms/       │
+                                    │ package cache   │   │ package           │
+                                    └─────────────────┘   │ routingalgorithms│
+                                                          └─────────┬─────────┘
+                                                                    │ init() 自注册
+                                                                    ▼
+                                                          ┌────────────────────┐
+                                                          │ 全局路由注册表      │
+                                                          │ (router.go 内)      │
+                                                          └────────────────────┘
+```
+
+**文字补充说明**：
+1. `main` 包是程序入口，它**单向依赖**标准库、第三方库和本仓库的 `pkg/` 下的库包。
+2. `pkg/plugins/gateway`（package gateway）又依赖 `pkg/cache` 和 `pkg/plugins/gateway/algorithms`（package routingalgorithms）。
+3. `algorithms` 包内的每个算法文件（如 `least_util.go`）通过 `init()` 把自己注册到全局路由表，`main` 最终通过 `routing.ModelRouterFactory`（[main.go:206](file:///Users/chl/chl-code/Job/aibrix/cmd/plugins/main.go#L206)）使用路由能力。
+4. 所有箭头都是**单向**的，不存在循环依赖——这是 Go 编译通过的前提。
+
+---
+
+## 十三、`go build` 视角下的包
+
+Go 编译器以**包**为编译单元。`go build ./...` 会编译当前 module 下所有包。每个包：
+- 独立编译为一个 `.a` 归档文件（缓存在 `GOCACHE`）。
+- 包之间通过导出的 API 链接。
+- 未被使用的导入会导致**编译错误**（Go 强制要求导入必用，除了 `_` 空导入）。
+
+这也是为什么 Go 编译快：包级并行编译 + 缓存复用。
+
+---
+
+## 十四、总结速查表
+
+| 概念 | 语法/形式 | 示例（本项目真实位置） |
+|------|-----------|----------------------|
+| 包声明 | `package name` | [main.go:17](file:///Users/chl/chl-code/Job/aibrix/cmd/plugins/main.go#L17) `package main` |
+| 入口包 | `package main` + `func main()` | [main.go:17,107](file:///Users/chl/chl-code/Job/aibrix/cmd/plugins/main.go#L17) |
+| 模块路径 | `go.mod` 里 `module` | [go.mod:1](file:///Users/chl/chl-code/Job/aibrix/go.mod#L1) |
+| 标准库导入 | `"fmt"` | [main.go:21](file:///Users/chl/chl-code/Job/aibrix/cmd/plugins/main.go#L21) |
+| 完整路径导入 | `"github.com/.../cache"` | [main.go:41](file:///Users/chl/chl-code/Job/aibrix/cmd/plugins/main.go#L41) |
+| 别名导入 | `alias "path"` | [main.go:45](file:///Users/chl/chl-code/Job/aibrix/cmd/plugins/main.go#L45) `routing "..."` |
+| 空导入 | `_ "path"` | [main.go:33](file:///Users/chl/chl-code/Job/aibrix/cmd/plugins/main.go#L33) |
+| 导出（公有） | 首字母大写 | [least_util.go:26](file:///Users/chl/chl-code/Job/aibrix/pkg/plugins/gateway/algorithms/least_util.go#L26) `RouterUtil` |
+| 非导出（私有） | 首字母小写 | [least_util.go:32](file:///Users/chl/chl-code/Job/aibrix/pkg/plugins/gateway/algorithms/least_util.go#L32) `leastUtilRouter` |
+| 初始化 | `func init()` | [util.go:49](file:///Users/chl/chl-code/Job/aibrix/pkg/utils/util.go#L49) |
+| 内部包 | 路径含 `/internal/` | `brixbench/internal/resolver/` |
+| 包文档 | `doc.go` + `Package xxx` | [doc.go:18](file:///Users/chl/chl-code/Job/aibrix/pkg/kvevent/doc.go#L18) |
+
+---
+
+以上就是 Go 语言「包」概念的完整讲解，所有示例均来自当前 aibrix 仓库的真实代码并标注了文件和行号。核心要点：**包是编译单元，靠目录聚合、首字母控制可见性、module 管理导入路径、init() 做初始化、internal/ 做硬边界**。掌握这些，你就能看懂任何 Go 项目的组织结构。
