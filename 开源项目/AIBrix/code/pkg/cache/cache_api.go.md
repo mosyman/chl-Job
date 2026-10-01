@@ -70,15 +70,19 @@ type RouterProvider interface {
 }
 ```
 
-注意区分两个概念：**导入路径**（import path，如 `pkg/cache/cache_api.go:21` 的 `"github.com/vllm-project/aibrix/pkg/types"`）和**包名**（package name，`pkg/types/output_predictor.go:16` 声明的 `package types`）。代码中引用类型时用的是包名 `types`，而不是导入路径的最后一段之外的东西——Go 允许包名与目录名不一致，但本仓库保持了一致。
+注意区分两个概念：**导入路径**（import path，如 `pkg/cache/cache_api.go:21` 的 `"github.com/vllm-project/aibrix/pkg/types"`）
+和**包名**（package name，`pkg/types/output_predictor.go:16` 声明的 `package types`）。代码中引用类型时用的是包名 `types`，而不是导入路径的最后一段之外的东西——Go 允许包名与目录名不一致，但本仓库保持了一致。
 
 ### 2.4 导入别名（import alias）
 
-`pkg/cache/cache_api.go:22` 的 `v1 "k8s.io/api/core/v1"` 给导入的包起了别名 `v1`，因此 `PodCache` 的方法签名里可以写 `*v1.Pod`（`pkg/cache/cache_api.go:46`）。这是 Kubernetes 生态的惯例：一个文件常常同时导入 `core/v1`、`apps/v1`、多个 CRD 组的 `v1alpha1` 等，不加别名会产生大量同名包冲突。别名必须在该文件内所有引用处一致使用。
+`pkg/cache/cache_api.go:22` 的 `v1 "k8s.io/api/core/v1"` 给导入的包起了别名 `v1`，因此 `PodCache` 的方法签名里可以写 `*v1.Pod`（`pkg/cache/cache_api.go:46`）。
+这是 Kubernetes 生态的惯例：一个文件常常同时导入 `core/v1`、`apps/v1`、多个 CRD 组的 `v1alpha1` 等，不加别名会产生大量同名包冲突。别名必须在该文件内所有引用处一致使用。
 
 ### 2.5 导出（exported）可见性
 
-`Cache`、`PodCache` 等标识符首字母大写，表示**导出**（包外可见）。这是 Go 用命名约定代替 `public/private` 关键字的机制。Go 规范要求可导出标识符应有文档注释——`pkg/cache/cache_api.go:25` 的 `// Cache is the root interface aggregating caching functionalities` 正是 godoc 规范格式：**注释以标识符名称开头**，这样 `go doc` 和 pkg.go.dev 能把注释正确关联到符号。
+`Cache`、`PodCache` 等标识符首字母大写，表示**导出**（包外可见）。
+这是 Go 用命名约定代替 `public/private` 关键字的机制。
+Go 规范要求可导出标识符应有文档注释——`pkg/cache/cache_api.go:25` 的 `// Cache is the root interface aggregating caching functionalities` 正是 godoc 规范格式：**注释以标识符名称开头**，这样 `go doc` 和 pkg.go.dev 能把注释正确关联到符号。
 
 ---
 
@@ -152,13 +156,19 @@ type Cache interface {
                                     在 Cache 的扁平方法集中出现两次（见 3.2）
 ```
 
-文字解释：顶部是 `Cache` 接口，向下分出 8 个被嵌入的接口（括号内是定义位置）。每个叶子接口携带自己的方法数（图中 “N个方法”）。注意中间的 `RequestTracker` 被 `Cache`（:30）和 `RequestTrackerRegistry`（:220）**双重嵌入**，这是下一节的重点。扁平化后 `Cache` 共有 19 个方法。
+文字解释：顶部是 `Cache` 接口，向下分出 8 个被嵌入的接口（括号内是定义位置）。
+每个叶子接口携带自己的方法数（图中 “N个方法”）。
+注意中间的 `RequestTracker` 被 `Cache`（:30）和 `RequestTrackerRegistry`（:220）**双重嵌入**，这是下一节的重点。扁平化后 `Cache` 共有 19 个方法。
 
 ### 3.2 重叠方法集（Go 1.14+ 特性）
 
-`Cache` 在 :30 嵌入了 `RequestTracker`，又在 :31 嵌入了 `RequestTrackerRegistry`，而后者在 `pkg/cache/cache_api.go:220` 又嵌入了 `RequestTracker`。扁平化后 `AddRequestCount`、`DoneRequestCount`、`DoneRequestTrace` 三个方法**各出现两次**。
+`Cache` 在 :30 嵌入了 `RequestTracker`，又在 :31 嵌入了 `RequestTrackerRegistry`，而后者在 `pkg/cache/cache_api.go:220` 又嵌入了 `RequestTracker`。
+扁平化后 `AddRequestCount`、`DoneRequestCount`、`DoneRequestTrace` 三个方法**各出现两次**。
 
-这在 Go 1.13 及更早版本是编译错误（`duplicate method AddRequestCount`）；**Go 1.14（2020 年发布）起，规范允许嵌入接口的方法集重叠，只要重复出现的方法签名完全一致（identical），就视为同一个方法**。本仓库 `go.mod:3` 声明 `go 1.22.5`，远高于 1.14，所以这段代码合法。这是一个容易被忽略的真实语法点：它使得“聚合接口 + 扩展接口”可以自由组合，而不必为了去重手动拆嵌套。
+这在 Go 1.13 及更早版本是编译错误（`duplicate method AddRequestCount`）；
+**Go 1.14（2020 年发布）起，规范允许嵌入接口的方法集重叠，只要重复出现的方法签名完全一致（identical），就视为同一个方法**。
+本仓库 `go.mod:3` 声明 `go 1.22.5`，远高于 1.14，所以这段代码合法。
+这是一个容易被忽略的真实语法点：它使得“聚合接口 + 扩展接口”可以自由组合，而不必为了去重手动拆嵌套。
 
 ### 3.3 隐式实现（structural typing / 鸭子类型）
 
