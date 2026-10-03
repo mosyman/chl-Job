@@ -172,18 +172,26 @@ type Cache interface {
 
 ### 3.3 隐式实现（structural typing / 鸭子类型）
 
-Go 没有 `implements` 关键字。**一个类型只要其方法集包含某接口的全部方法，就自动实现该接口**，无需声明。这是编译期静态检查的结构化类型（structural typing），区别于 Java/C# 的名义类型（nominal typing，必须在类定义处声明 `implements`）。
+Go 没有 `implements` 关键字。
+**一个类型只要其方法集包含某接口的全部方法，就自动实现该接口**，无需声明。
+这是编译期静态检查的结构化类型（structural typing），区别于 Java/C# 的名义类型（nominal typing，必须在类定义处声明 `implements`）。
 
 本仓库的实现方是 `Store` 结构体（定义于 `pkg/cache/cache_init.go:75`），构造函数 `New` 在 `pkg/cache/cache_init.go:202`。它的接口方法分散在 `pkg/cache/` 下按职责拆分的多个文件中实现，例如：
 
 - `func (c *Store) GetPod(...)` — `pkg/cache/cache_impl.go:37`，实现 `PodCache.GetPod`；
 - 其余分别落在 `cache_metrics.go`（MetricCache）、`cache_trace.go`（RequestTracker）、`cache_running_requests.go`、`cache_profile.go`（ProfileCache）、`model.go`（ModelCache）等文件中。
 
-**指针接收者与方法集的关系**（重要原理）：Go 规定 `T` 类型值的方法集只包含**值接收者**方法，而 `*T` 的方法集包含**值接收者 + 指针接收者**方法。`Store` 的全部方法都用指针接收者 `func (c *Store) ...` 声明（见 `pkg/cache/cache_impl.go:37`），因此**只有 `*Store` 满足 `Cache`，`Store` 值本身不满足**。`pkg/cache/cache_init.go:206` 的 `store = &Store{...}` 取的正是指针。若写 `var _ cache.Cache = Store{}` 会直接编译报错；`var _ cache.Cache = (*Store)(nil)` 则能通过。
+**指针接收者与方法集的关系**（重要原理）：Go 规定 `T` 类型值的方法集只包含**值接收者**方法，而 `*T` 的方法集包含**值接收者 + 指针接收者**方法。
+`Store` 的全部方法都用指针接收者 `func (c *Store) ...` 声明（见 `pkg/cache/cache_impl.go:37`），
+因此**只有 `*Store` 满足 `Cache`，`Store` 值本身不满足**。
+`pkg/cache/cache_init.go:206` 的 `store = &Store{...}` 取的正是指针。
+若写 `var _ cache.Cache = Store{}` 会直接编译报错；`var _ cache.Cache = (*Store)(nil)` 则能通过。
 
 ### 3.4 接口值的内部表示与动态派发
 
-接口值在运行时是一个**二元组 `(dynamic type, dynamic value)`**。当 `pkg/plugins/gateway/gateway.go:86` 的字段 `cache cache.Cache` 被赋值为 `*Store` 实例后，这个字段就持有动态类型 `*cache.Store` 和指向具体实例的动态值；每次调用 `cache.GetPod(...)` 都经**接口表（itab）做动态派发**，找到 `*Store` 的方法实现。两个推论值得记住：
+接口值在运行时是一个**二元组 `(dynamic type, dynamic value)`**。
+当 `pkg/plugins/gateway/gateway.go:86` 的字段 `cache cache.Cache` 被赋值为 `*Store` 实例后，这个字段就持有动态类型 `*cache.Store` 和指向具体实例的动态值；
+每次调用 `cache.GetPod(...)` 都经**接口表（itab）做动态派发**，找到 `*Store` 的方法实现。两个推论值得记住：
 
 1. **nil 接口 ≠ 含 nil 指针的接口**：把一个 nil 的 `*Store` 赋给 `cache.Cache`，接口的动态类型仍是 `*Store`，`cache == nil` 判断为 false，调用方法时接收者 `c` 为 nil——方法内若解引用 `c` 的字段才会 panic。这是 Go 最著名的陷阱之一；
 2. **接口不为 nil 就可调用**，但行为取决于接收者是否处理了 nil（例如 `pkg/cache/cache_api.go:179-181` 的注释明确要求 `RequestTracker` 的实现必须容忍 `ctx` 为 nil——`Contract: ctx may be nil ... implementations MUST guard against a nil ctx`，这是接口契约写进文档的范例）。
@@ -198,7 +206,10 @@ Go 没有 `implements` 关键字。**一个类型只要其方法集包含某接�
 
 ### 4.1 组合优于继承（composition over inheritance）
 
-Go 没有类继承。接口嵌入是**横向的能力聚合**，不是纵向的 is-a 层级：`Cache` 不是“一种特殊的 PodCache”，而是“同时具备 8 种能力的门面（facade）”。被嵌入的接口之间、接口与 `Cache` 之间都没有父子关系——`PodCache` 完全不知道 `Cache` 的存在。这与 Java 中“大接口 extends 多个小接口”最本质的区别是：**Go 的实现方与接口之间没有任何声明上的耦合**，`Store` 甚至可以不知道 `Cache` 存在（只要方法签名对上）。依赖方向是单向的：`cache` 包 → `types` 包（`pkg/cache/cache_api.go:21` 的导入），`types` 包不反向导入 `cache`，从而避免循环导入。
+Go 没有类继承。接口嵌入是**横向的能力聚合**，不是纵向的 is-a 层级：`Cache` 不是“一种特殊的 PodCache”，而是“同时具备 8 种能力的门面（facade）”。
+被嵌入的接口之间、接口与 `Cache` 之间都没有父子关系——`PodCache` 完全不知道 `Cache` 的存在。
+这与 Java 中“大接口 extends 多个小接口”最本质的区别是：**Go 的实现方与接口之间没有任何声明上的耦合**，
+`Store` 甚至可以不知道 `Cache` 存在（只要方法签名对上）。依赖方向是单向的：`cache` 包 → `types` 包（`pkg/cache/cache_api.go:21` 的导入），`types` 包不反向导入 `cache`，从而避免循环导入。
 
 ### 4.2 接口隔离与 Rob Pike 的“小接口”原则
 
